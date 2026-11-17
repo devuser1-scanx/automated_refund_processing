@@ -65,7 +65,8 @@ CREATE INDEX IF NOT EXISTS refund_queue_unnotified
 
 
 -- Appointment types that are never auto-refunded. Matched against
--- appointment.appointment_type ignoring case and surrounding spaces. To add one:
+-- appointment.appointment_type ignoring case, spaces, hyphens and punctuation
+-- ('IVF Follow-Up Ultrasound' = 'ivf followup  ultrasound'). To add one:
 --   INSERT INTO refund_excluded_appointment_type (name) VALUES ('...');
 CREATE TABLE IF NOT EXISTS refund_excluded_appointment_type (
   name        varchar(150) PRIMARY KEY,
@@ -79,9 +80,11 @@ ON CONFLICT DO NOTHING;
 
 CREATE OR REPLACE FUNCTION is_refund_excluded_type(appt_type text) RETURNS boolean
 LANGUAGE sql STABLE AS $$
-  SELECT EXISTS (
+  SELECT regexp_replace(lower(coalesce(appt_type, '')), '[^a-z0-9]', '', 'g') <> ''
+     AND EXISTS (
     SELECT 1 FROM refund_excluded_appointment_type
-     WHERE lower(trim(name)) = lower(trim(coalesce(appt_type, '')))
+     WHERE regexp_replace(lower(name), '[^a-z0-9]', '', 'g')
+         = regexp_replace(lower(coalesce(appt_type, '')), '[^a-z0-9]', '', 'g')
   )
 $$;
 

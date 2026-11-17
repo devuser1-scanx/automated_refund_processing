@@ -150,12 +150,22 @@ def test_second_run_does_not_refund_again(conn, fakes):
     assert len(fakes["refunds"]) == 1
 
 
-@pytest.mark.parametrize("appt_type", ["IVF Monitoring Package", "IVF Follow-Up Ultrasound", " ivf monitoring package "])
+@pytest.mark.parametrize("appt_type", [
+    "IVF Monitoring Package", "IVF Follow-Up Ultrasound", " ivf monitoring package ",
+    "IVF Follow Up Ultrasound", "ivf followup ultrasound", "IVF-Monitoring  Package",
+    "IVF Follow-Up Ultrasound.", "IVF MONITORING PACKAGE",
+])
 def test_ivf_types_are_never_queued(conn, fakes, appt_type):
     add_cancelled(conn, "A9", appt_type=appt_type)
     assert queue(conn, "A9") is None
     assert worker.run_once() == 0
     assert fakes["refunds"] == []
+
+
+@pytest.mark.parametrize("appt_type", ["Consultation", "IVF Consultation", None, "", "---"])
+def test_other_types_are_still_queued(conn, fakes, appt_type):
+    add_cancelled(conn, "A9b", appt_type=appt_type)
+    assert queue(conn, "A9b")[0] == "pending"
 
 
 def test_type_changed_to_excluded_after_queueing(conn, fakes):
