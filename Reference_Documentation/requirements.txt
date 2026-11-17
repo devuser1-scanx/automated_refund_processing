@@ -1,0 +1,6 @@
+psycopg==3.3.6
+psycopg-binary==3.3.6
+requests==2.34.2
+stripe==16.1.0
+tzdata==2025.2
+google-auth==2.62.2
