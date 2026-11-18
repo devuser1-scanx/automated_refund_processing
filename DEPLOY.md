@@ -63,7 +63,7 @@ The job runs as the user in the `DB_URL` secret. That user needs `SELECT` on `ap
 
 An appointment counts as cancelled when its `status_label` is cancelled / canceled / no-show **or** its boolean `canceled` column is true. The trigger and the worker both use the function `is_refundable_appointment(status_label, canceled)`.
 
-If migration 001 was run before this change, run it again (it is safe to repeat) **before** redeploying the job (step 5). The new worker calls a function that only exists after the migration.
+If migration 001 was run before this change, run it again (it is safe to repeat) **before** redeploying the job (step 5). The new worker calls a function that only exists after the migration, and the patient SMS needs three new `refund_queue` columns (`sms_notified_at`, `sms_attempts`, `sms_error`) that the migration adds. Refunds that already succeeded are marked as texted, so old refunds never get a text.
 
 The trigger is `SECURITY DEFINER`, so the app's own DB user needs no new grants. There is no backfill: only status changes made after this migration are queued.
 
@@ -78,8 +78,16 @@ The trigger is `SECURITY DEFINER`, so the app's own DB user needs no new grants.
 | `ACUITY_API_KEY` | `ACUITY_API_KEY` |
 | `GMAIL_SENDER_EMAIL` | `GMAIL_SENDER_EMAIL` |
 | `GMAIL_SERVICE_ACCOUNT_JSON` | `GMAIL_SERVICE_ACCOUNT_JSON` |
+| `TWILIO_ACCOUNT_SID` | `TWILIO_ACCOUNT_SID` (patient SMS) |
+| `TWILIO_AUTH_TOKEN` | `TWILIO_AUTH_TOKEN` (patient SMS) |
+| `TWILIO_FROM_NUMBER` | `TWILIO_VOICE_FROM_NUMBER` (Twilio sending number, e.g. `+12145550100`) |
+| `CLINIC_PHONE` | `TWILIO_VOICE_FROM_NUMBER` (same secret: the number the text tells patients to call) |
 
-Everything except `DATABASE_URL` already exists and is shared with other ScanX services. Never add a new version to those from this project.
+Without all four SMS settings the job skips texting and everything else works as before. These three secrets already exist (`TWILIO_VOICE_FROM_NUMBER` is used for both the sending number and the clinic number). If any is stored under a different name, use that name on the right-hand side in the step 4 loop and the step 5 command. Stray spaces or a trailing newline in these values are ignored.
+
+**Patient email receipt:** the job does not send one. Stripe sends it. In the Stripe dashboard make sure Settings → Business → Customer emails → Payments → **Refunds** is on (it already is for this account). It works because Acuity puts the patient's email on the Stripe charge.
+
+Everything except `DATABASE_URL` and the two Twilio secrets already exists and is shared with other ScanX services. Never add a new version to those from this project.
 
 The existing `db-host` secret holds only the Cloud SQL socket path (`/cloudsql/PROJECT:REGION:INSTANCE`), not a connection string. The worker needs a full one, so use a dedicated secret named `DB_URL`. Do not change `db-host`; other services use it.
 
@@ -116,7 +124,8 @@ gcloud iam service-accounts create automated-refund-processing \
 # "already exists" is fine, carry on
 
 for s in DB_URL scanx-stripe-secret-key ACUITY_USER_ID ACUITY_API_KEY \
-         GCHAT_WEBHOOK_Automated_refund_transactions GMAIL_SENDER_EMAIL GMAIL_SERVICE_ACCOUNT_JSON; do
+         GCHAT_WEBHOOK_Automated_refund_transactions GMAIL_SENDER_EMAIL GMAIL_SERVICE_ACCOUNT_JSON \
+         TWILIO_ACCOUNT_SID TWILIO_AUTH_TOKEN TWILIO_VOICE_FROM_NUMBER; do
   gcloud secrets add-iam-policy-binding $s \
     --member="serviceAccount:$SA" --role=roles/secretmanager.secretAccessor
 done
@@ -145,12 +154,18 @@ gcloud run jobs deploy automated-refund-processing \
   --source . --region us-central1 \
   --service-account automated-refund-processing@vernal-maker-473121-k4.iam.gserviceaccount.com \
   --set-cloudsql-instances vernal-maker-473121-k4:us-central1:scanx-postgres-db \
-  --set-secrets DATABASE_URL=DB_URL:latest,STRIPE_SECRET_KEY=scanx-stripe-secret-key:latest,ACUITY_USER_ID=ACUITY_USER_ID:latest,ACUITY_API_KEY=ACUITY_API_KEY:latest,GCHAT_WEBHOOK_URL=GCHAT_WEBHOOK_Automated_refund_transactions:latest,GMAIL_SENDER_EMAIL=GMAIL_SENDER_EMAIL:latest,GMAIL_SERVICE_ACCOUNT_JSON=GMAIL_SERVICE_ACCOUNT_JSON:latest \
+  --set-secrets DATABASE_URL=DB_URL:latest,STRIPE_SECRET_KEY=scanx-stripe-secret-key:latest,ACUITY_USER_ID=ACUITY_USER_ID:latest,ACUITY_API_KEY=ACUITY_API_KEY:latest,GCHAT_WEBHOOK_URL=GCHAT_WEBHOOK_Automated_refund_transactions:latest,GMAIL_SENDER_EMAIL=GMAIL_SENDER_EMAIL:latest,GMAIL_SERVICE_ACCOUNT_JSON=GMAIL_SERVICE_ACCOUNT_JSON:latest,TWILIO_ACCOUNT_SID=TWILIO_ACCOUNT_SID:latest,TWILIO_AUTH_TOKEN=TWILIO_AUTH_TOKEN:latest,TWILIO_FROM_NUMBER=TWILIO_VOICE_FROM_NUMBER:latest,CLINIC_PHONE=TWILIO_VOICE_FROM_NUMBER:latest \
   --set-env-vars "^;^NOTIFY_EMAILS=devuser1@scanx.care,clinic1@scanx.care;DISPLAY_TIMEZONE=America/Chicago;BATCH_SIZE=20;MAX_ATTEMPTS=5" \
   --tasks 1 --max-retries 0 --task-timeout 300s
 ```
 
 `^;^` tells gcloud to split the env vars on `;`, because `NOTIFY_EMAILS` itself contains a comma.
+
+The text a patient receives is:
+
+> ScanX Health: Your refund of $100.00 for your November 17, 2026 appointment has been issued. For questions, please call (214) 555-0199. Receipt of this transaction is sent to you via your registered email in the account.
+
+It is sent once per succeeded refund, to the phone number on the appointment (numbers without a country code are treated as US). Refunds that were already done by hand are not texted. Failures are in `refund_queue.sms_error`; temporary ones are retried on the next run (up to 5 times), bad or missing numbers are not retried. Check with `SELECT id, appointment_id, sms_notified_at, sms_attempts, sms_error FROM refund_queue WHERE status = 'succeeded' ORDER BY id DESC;`.
 
 Common failures:
 - `Permission denied on secret ...`: step 4 binding is missing for that secret. Wait a minute after fixing it, then redeploy.

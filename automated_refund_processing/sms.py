@@ -66,26 +66,31 @@ def message_text(row: dict) -> str:
     return MESSAGE.format(
         amount=money(row["amount_refunded"]),
         date=appt_date or "recent",
-        clinic_phone=os.environ["CLINIC_PHONE"].strip(),
+        clinic_phone=_env("CLINIC_PHONE"),
     )
 
 
+def _env(name: str) -> str:
+    """Setting value without stray spaces / newlines (secrets made in the console often have one)."""
+    return os.environ.get(name, "").strip()
+
+
 def enabled() -> bool:
-    return bool(os.environ.get("TWILIO_ACCOUNT_SID") and os.environ.get("TWILIO_AUTH_TOKEN")
-                and (os.environ.get("TWILIO_FROM_NUMBER") or os.environ.get("TWILIO_MESSAGING_SERVICE_SID"))
-                and os.environ.get("CLINIC_PHONE"))
+    return bool(_env("TWILIO_ACCOUNT_SID") and _env("TWILIO_AUTH_TOKEN")
+                and (_env("TWILIO_FROM_NUMBER") or _env("TWILIO_MESSAGING_SERVICE_SID"))
+                and _env("CLINIC_PHONE"))
 
 
 def _send_sms(to: str, body: str) -> None:
     data = {"To": to, "Body": body}
-    if os.environ.get("TWILIO_MESSAGING_SERVICE_SID"):
-        data["MessagingServiceSid"] = os.environ["TWILIO_MESSAGING_SERVICE_SID"]
+    if _env("TWILIO_MESSAGING_SERVICE_SID"):
+        data["MessagingServiceSid"] = _env("TWILIO_MESSAGING_SERVICE_SID")
     else:
-        data["From"] = os.environ["TWILIO_FROM_NUMBER"]
-    sid = os.environ["TWILIO_ACCOUNT_SID"]
+        data["From"] = _env("TWILIO_FROM_NUMBER")
+    sid = _env("TWILIO_ACCOUNT_SID")
     resp = requests.post(
         TWILIO_URL.format(sid=sid), data=data,
-        auth=(sid, os.environ["TWILIO_AUTH_TOKEN"]), timeout=15,
+        auth=(sid, _env("TWILIO_AUTH_TOKEN")), timeout=15,
     )
     if resp.status_code < 400:
         return

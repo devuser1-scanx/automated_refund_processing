@@ -16,6 +16,9 @@ Full design (diagrams, tables, edge cases): [docs/design.pdf](docs/design.pdf), 
 - `automated_refund_processing/notify.py`: email + Google Chat alert for every succeeded, failed and
   needs_review refund (patient, appointment date/day/time, reason, amount, phone, email, full queue record).
   Each channel is tracked separately and retried next run if it was down.
+- `automated_refund_processing/sms.py`: text message to the patient (Twilio) after each succeeded refund.
+  Tracked in `sms_notified_at`, `sms_attempts`, `sms_error`. The patient's email receipt is Stripe's own
+  refund email (Stripe → Settings → Business → Customer emails → Payments → Refunds, already on); the job does not send it.
 - `tests/test_worker.py`: runs against a scratch Postgres (`TEST_DATABASE_URL`), Acuity and Stripe faked.
 
 ## Run tests
@@ -44,6 +47,10 @@ Step-by-step commands for project vernal-maker-473121-k4 are in [DEPLOY.md](DEPL
 | `GMAIL_SENDER_EMAIL`, `GMAIL_SERVICE_ACCOUNT_JSON` | existing Secret Manager secrets; Gmail API + domain-wide delegation (`gmail.send`), same as the other ScanX services |
 | `GCHAT_WEBHOOK_URL` | incoming webhook of the Google Chat space (secret) |
 | `DISPLAY_TIMEZONE` | `America/Chicago` |
+
+| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` | Twilio credentials (secrets) for the patient SMS |
+| `TWILIO_FROM_NUMBER` | Twilio sending number, e.g. `+12145550100` (or `TWILIO_MESSAGING_SERVICE_SID`) |
+| `CLINIC_PHONE` | number the patient text tells them to call |
 
 A channel with no settings is skipped. Undelivered alerts are retried every run, up to 5 times (`notify_attempts`, `notify_error`).
 
