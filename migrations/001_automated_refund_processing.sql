@@ -1,6 +1,7 @@
 -- automated_refund_processing: database objects
 --
 -- When a paid appointment's status_label becomes cancelled / canceled / no-show,
+-- or its boolean `canceled` column becomes true,
 -- and its appointment_type is not excluded, a refund is queued with a grace period.
 -- If staff revert the status before the grace period ends, the queued refund is
 -- cancelled. The worker (automated_refund_processing/worker.py) picks up due rows
@@ -20,6 +21,13 @@ CREATE OR REPLACE FUNCTION is_refundable_status(label text) RETURNS boolean
 LANGUAGE sql IMMUTABLE AS $$
   SELECT regexp_replace(lower(coalesce(label, '')), '[^a-z]', '', 'g')
          IN ('cancelled', 'canceled', 'noshow')
+$$;
+
+-- An appointment counts as cancelled when its status_label is cancelled /
+-- canceled / no-show OR its boolean `canceled` column is true.
+CREATE OR REPLACE FUNCTION is_refundable_appointment(label text, canceled boolean) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT coalesce(canceled, false) OR is_refundable_status(label)
 $$;
 
 CREATE TABLE IF NOT EXISTS refund_queue (
@@ -43,9 +51,29 @@ CREATE TABLE IF NOT EXISTS refund_queue (
   gchat_notified_at      timestamptz,
   notify_attempts        integer NOT NULL DEFAULT 0,
   notify_error           text,
+  -- Text message to the patient after a succeeded refund (automated_refund_processing/sms.py).
+  sms_notified_at        timestamptz,
+  sms_attempts           integer NOT NULL DEFAULT 0,
+  sms_error              text,
   created_at             timestamptz NOT NULL DEFAULT now(),
   updated_at             timestamptz NOT NULL DEFAULT now()
 );
+
+-- Upgrade path for a refund_queue created before the SMS columns existed.
+-- Refunds that already succeeded are marked as texted, so deploying the SMS
+-- feature never sends texts for old refunds.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = current_schema()
+                    AND table_name = 'refund_queue' AND column_name = 'sms_notified_at') THEN
+    ALTER TABLE refund_queue
+      ADD COLUMN sms_notified_at timestamptz,
+      ADD COLUMN sms_attempts    integer NOT NULL DEFAULT 0,
+      ADD COLUMN sms_error       text;
+    UPDATE refund_queue SET sms_notified_at = now() WHERE status = 'succeeded';
+  END IF;
+END $$;
 
 -- At most one live or completed refund per appointment. Cancelled / failed /
 -- needs_review rows don't block a new one, so cancel -> undo -> cancel works.
@@ -95,16 +123,20 @@ CREATE OR REPLACE FUNCTION queue_refund_on_status_change() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
   was_refundable boolean := TG_OP = 'UPDATE'
-                            AND is_refundable_status(OLD.status_label)
+                            AND is_refundable_appointment(OLD.status_label, OLD.canceled)
                             AND coalesce(OLD.paid, false);
-  now_refundable boolean := is_refundable_status(NEW.status_label)
+  now_refundable boolean := is_refundable_appointment(NEW.status_label, NEW.canceled)
                             AND coalesce(NEW.paid, false);
 BEGIN
   IF now_refundable AND NOT was_refundable
      AND NOT is_refund_excluded_type(NEW.appointment_type) THEN
     INSERT INTO refund_queue (appointment_id, trigger_status, amount, due_at)
-    VALUES (NEW.appointment_id, NEW.status_label, NEW.amount_paid,
-            now() + refund_grace_period())
+    VALUES (NEW.appointment_id,
+            -- the label if it is cancelled / no-show, else 'Canceled' (the flag
+            -- was set). Never NULL: trigger_status is NOT NULL.
+            CASE WHEN is_refundable_status(NEW.status_label)
+                 THEN NEW.status_label ELSE 'Canceled' END,
+            NEW.amount_paid, now() + refund_grace_period())
     ON CONFLICT (appointment_id)
       WHERE status IN ('pending', 'processing', 'succeeded')
       DO NOTHING;
@@ -114,7 +146,8 @@ BEGIN
     -- processed are left alone; the worker re-checks before refunding.
     UPDATE refund_queue
        SET status = 'cancelled', updated_at = now(),
-           last_error = 'status reverted to ' || coalesce(NEW.status_label, 'NULL')
+           last_error = 'cancellation reverted (status_label=' || coalesce(NEW.status_label, 'NULL')
+                        || ', canceled=' || coalesce(NEW.canceled::text, 'NULL') || ')'
      WHERE appointment_id = NEW.appointment_id
        AND status = 'pending';
   END IF;
@@ -125,7 +158,7 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_queue_refund ON appointment;
 CREATE TRIGGER trg_queue_refund
-  AFTER INSERT OR UPDATE OF status_label, paid ON appointment
+  AFTER INSERT OR UPDATE OF status_label, paid, canceled ON appointment
   FOR EACH ROW EXECUTE FUNCTION queue_refund_on_status_change();
 
 COMMIT;

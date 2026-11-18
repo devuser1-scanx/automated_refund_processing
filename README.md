@@ -1,6 +1,6 @@
 # automated_refund_processing
 
-Full Stripe refund when a paid appointment is set to Cancelled / Canceled / No-Show,
+Full Stripe refund when a paid appointment is set to Cancelled / Canceled / No-Show, or its boolean `canceled` column becomes true,
 10 to 15 minutes after the change, so mistakes can be undone first.
 Appointment types in `refund_excluded_appointment_type` (IVF Monitoring Package,
 IVF Follow-Up Ultrasound) are never auto-refunded.

@@ -35,7 +35,8 @@ def conn(monkeypatch):
         c.execute("""CREATE TABLE appointment (
             id serial PRIMARY KEY, appointment_id varchar(50) UNIQUE NOT NULL,
             appointment_type varchar(150), amount_paid numeric(10,2), paid boolean DEFAULT false,
-            status_label varchar(50), first_name varchar(100), last_name varchar(100),
+            status_label varchar(50), canceled boolean DEFAULT false,
+            first_name varchar(100), last_name varchar(100),
             phone varchar(20), email varchar(150), location varchar(100),
             appointment_datetime timestamptz, date timestamp, time varchar(20))""")
         for m in MIGRATIONS:
@@ -103,6 +104,62 @@ def test_payment_intent_and_no_show(conn, fakes):
     fakes["payments"]["A2"] = [worker.Payment("pi_9", Decimal("100.00"))]
     worker.run_once()
     assert fakes["refunds"][0][1]["payment_intent"] == "pi_9"
+
+
+def add_scheduled(c, appt, *, paid=True, label="Scheduled", canceled=False, appt_type="Consultation"):
+    c.execute("INSERT INTO appointment (appointment_id, appointment_type, amount_paid, paid, status_label, canceled, "
+              "first_name, last_name, location, appointment_datetime) "
+              "VALUES (%s, %s, 100, %s, %s, %s, 'Test', 'Tester', 'Dallas Location', '2026-11-17 14:45:00+00')",
+              (appt, appt_type, paid, label, canceled))
+
+
+def test_canceled_flag_queues_and_refunds(conn, fakes):
+    add_scheduled(conn, "C1")
+    assert queue(conn, "C1") is None
+    conn.execute("UPDATE appointment SET canceled = true WHERE appointment_id = 'C1'")
+    assert queue(conn, "C1")[0] == "pending"
+    assert conn.execute("SELECT trigger_status FROM refund_queue WHERE appointment_id = 'C1'").fetchone()[0] == "Canceled"
+    conn.execute("UPDATE refund_queue SET due_at = now() - interval '1 second'")
+    fakes["payments"]["C1"] = [worker.Payment("ch_c1", Decimal("100.00"))]
+    assert worker.run_once() == 1
+    assert queue(conn, "C1")[0] == "succeeded"
+
+
+def test_canceled_flag_with_empty_label_does_not_break_the_update(conn, fakes):
+    add_scheduled(conn, "C2", label=None)
+    conn.execute("UPDATE appointment SET canceled = true WHERE appointment_id = 'C2'")
+    assert queue(conn, "C2")[0] == "pending"
+
+
+def test_canceled_flag_already_set_on_insert(conn, fakes):
+    add_scheduled(conn, "C3", canceled=True)
+    assert queue(conn, "C3")[0] == "pending"
+
+
+def test_canceled_flag_reverted_cancels_the_refund(conn, fakes):
+    add_scheduled(conn, "C4", canceled=True)
+    conn.execute("UPDATE appointment SET canceled = false WHERE appointment_id = 'C4'")
+    assert queue(conn, "C4")[0] == "cancelled"
+    conn.execute("UPDATE refund_queue SET due_at = now() - interval '1 second'")
+    assert worker.run_once() == 0 and fakes["refunds"] == []
+
+
+def test_canceled_flag_ignored_when_unpaid_or_excluded(conn, fakes):
+    add_scheduled(conn, "C5", paid=False, canceled=True)
+    add_scheduled(conn, "C6", canceled=True, appt_type="IVF Follow-Up Ultrasound")
+    assert queue(conn, "C5") is None and queue(conn, "C6") is None
+
+
+def test_label_still_works_when_flag_is_false_or_null(conn, fakes):
+    add_scheduled(conn, "C7", canceled=None)
+    conn.execute("UPDATE appointment SET status_label = 'No Show' WHERE appointment_id = 'C7'")
+    assert queue(conn, "C7")[0] == "pending"
+
+
+def test_flag_reverted_after_queued_but_label_still_cancelled_keeps_refund(conn, fakes):
+    add_scheduled(conn, "C8", label="Cancelled", canceled=True)
+    conn.execute("UPDATE appointment SET canceled = false WHERE appointment_id = 'C8'")
+    assert queue(conn, "C8")[0] == "pending"  # the label still says cancelled
 
 
 def test_not_due_yet_is_left_alone(conn, fakes):
@@ -289,3 +346,135 @@ def test_gmail_api_send(monkeypatch):
         status_code=403, text="", json=lambda: {"error": {"message": "Delegation denied"}}))
     with pytest.raises(RuntimeError, match="Delegation denied"):
         notify._send_email(msg)
+
+
+# --- Patient SMS ------------------------------------------------------------
+
+@pytest.fixture
+def texts(monkeypatch, fakes):
+    from automated_refund_processing import sms
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACx")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("TWILIO_FROM_NUMBER", "+12145550100")
+    monkeypatch.setenv("CLINIC_PHONE", "(214) 555-0199")
+    sent = {"messages": [], "error": None}
+
+    def send(to, body):
+        if sent["error"]:
+            raise sent["error"]
+        sent["messages"].append((to, body))
+
+    monkeypatch.setattr(sms, "_send_sms", send)
+    return sent
+
+
+def refunded(conn, fakes, appt, **kw):
+    add_cancelled(conn, appt, **kw)
+    fakes["payments"][appt] = [worker.Payment(f"ch_{appt}", Decimal("100.00"))]
+    worker.run_once()
+
+
+def test_patient_gets_the_refund_text(conn, fakes, texts):
+    refunded(conn, fakes, "S1")
+    assert texts["messages"] == [(
+        "+916355325189",
+        "ScanX Health: Your refund of $100.00 for your November 17, 2026 appointment has been issued. "
+        "For questions, please call (214) 555-0199. "
+        "Receipt of this transaction is sent to you via your registered email in the account.")]
+    assert conn.execute("SELECT sms_notified_at IS NOT NULL, sms_attempts FROM refund_queue "
+                        "WHERE appointment_id = 'S1'").fetchone() == (True, 0)
+    worker.run_once()
+    assert len(texts["messages"]) == 1  # never texted twice
+
+
+def test_no_text_unless_refund_succeeded(conn, fakes, texts):
+    add_cancelled(conn, "S2")  # no Stripe payment -> needs_review
+    add_cancelled(conn, "S3", due_now=False)  # still pending
+    worker.run_once()
+    assert queue(conn, "S2")[0] == "needs_review" and texts["messages"] == []
+
+
+def test_already_refunded_by_hand_is_not_texted(conn, fakes, texts, monkeypatch):
+    monkeypatch.setattr(stripe.Refund, "create", lambda **k: (_ for _ in ()).throw(
+        stripe.InvalidRequestError("already", "charge", code="charge_already_refunded")))
+    refunded(conn, fakes, "S4")
+    assert queue(conn, "S4")[0] == "succeeded" and texts["messages"] == []
+
+
+def test_twilio_down_retries_then_sends(conn, fakes, texts):
+    texts["error"] = RuntimeError("twilio 503")
+    refunded(conn, fakes, "S5")
+    assert queue(conn, "S5")[0] == "succeeded" and texts["messages"] == []
+    assert conn.execute("SELECT sms_attempts, sms_error FROM refund_queue WHERE appointment_id = 'S5'"
+                        ).fetchone() == (1, "twilio 503")
+    texts["error"] = None
+    worker.run_once()
+    assert len(texts["messages"]) == 1
+    assert conn.execute("SELECT sms_error FROM refund_queue WHERE appointment_id = 'S5'").fetchone() == (None,)
+
+
+def test_bad_phone_is_recorded_and_not_retried(conn, fakes, texts):
+    refunded(conn, fakes, "S6")
+    conn.execute("UPDATE refund_queue SET sms_notified_at = NULL, sms_attempts = 0 WHERE appointment_id = 'S6'")
+    conn.execute("UPDATE appointment SET phone = 'n/a' WHERE appointment_id = 'S6'")
+    texts["messages"].clear()
+    worker.run_once()
+    row = conn.execute("SELECT sms_attempts, sms_error FROM refund_queue WHERE appointment_id = 'S6'").fetchone()
+    assert row[0] == notify.MAX_NOTIFY_ATTEMPTS and "phone" in row[1] and texts["messages"] == []
+
+
+def test_sms_failure_never_blocks_refund_or_alerts(conn, fakes, texts):
+    texts["error"] = RuntimeError("twilio down")
+    refunded(conn, fakes, "S7")
+    assert queue(conn, "S7")[0] == "succeeded"
+    assert len(fakes["emails"]) == 1 and len(fakes["cards"]) == 1
+
+
+def test_sms_off_without_twilio_settings(conn, fakes):
+    refunded(conn, fakes, "S8")
+    assert queue(conn, "S8")[0] == "succeeded"
+    assert conn.execute("SELECT sms_notified_at, sms_attempts FROM refund_queue "
+                        "WHERE appointment_id = 'S8'").fetchone() == (None, 0)
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("(214) 555-0100", "+12145550100"), ("214-555-0100", "+12145550100"),
+    ("1 214 555 0100", "+12145550100"), ("+12145550100", "+12145550100"),
+    ("+91 63553 25189", "+916355325189"),
+])
+def test_phone_to_e164(raw, expected):
+    from automated_refund_processing import sms
+    assert sms.to_e164(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [None, "", "n/a", "555-0100", "12345"])
+def test_phone_to_e164_rejects_junk(raw):
+    from automated_refund_processing import sms
+    with pytest.raises(sms.PermanentError):
+        sms.to_e164(raw)
+
+
+def test_twilio_request_and_errors(monkeypatch):
+    from automated_refund_processing import sms
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACx")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("TWILIO_FROM_NUMBER", "+12145550100")
+    seen = {}
+
+    def post(url, data, auth, timeout):
+        seen.update(url=url, data=data, auth=auth)
+        return SimpleNamespace(status_code=seen.get("status", 201), text="",
+                               json=lambda: {"code": 21211, "message": "Invalid 'To'"})
+
+    monkeypatch.setattr(sms.requests, "post", post)
+    sms._send_sms("+12145550111", "hi")
+    assert seen["url"].endswith("/Accounts/ACx/Messages.json") and seen["auth"] == ("ACx", "tok")
+    assert seen["data"] == {"To": "+12145550111", "Body": "hi", "From": "+12145550100"}
+    seen["status"] = 400
+    with pytest.raises(sms.PermanentError, match="21211"):
+        sms._send_sms("+12145550111", "hi")
+    for status in (429, 503):
+        seen["status"] = status
+        with pytest.raises(RuntimeError) as e:
+            sms._send_sms("+12145550111", "hi")
+        assert not isinstance(e.value, sms.PermanentError)

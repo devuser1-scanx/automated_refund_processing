@@ -9,6 +9,7 @@ Run every 5 minutes (Cloud Scheduler -> Cloud Run Job). Each run:
   4. Sends email + Google Chat alerts for succeeded / failed / needs_review
      rows not yet notified (see notify.py). A channel that is down is retried
      on the next run.
+  5. Texts the patient about each succeeded refund (see sms.py).
 
 Environment:
   DATABASE_URL        postgres connection string (Cloud SQL socket is fine)
@@ -18,6 +19,7 @@ Environment:
   BATCH_SIZE          rows per run (default 20)
   MAX_ATTEMPTS        retries for transient errors before 'failed' (default 5)
   Alert settings (NOTIFY_EMAILS, GMAIL_*, GCHAT_WEBHOOK_URL, DISPLAY_TIMEZONE): see notify.py
+  Patient SMS settings (TWILIO_*, CLINIC_PHONE): see sms.py
 """
 
 import logging
@@ -30,7 +32,7 @@ import requests
 import stripe
 from psycopg.rows import dict_row
 
-from automated_refund_processing import notify
+from automated_refund_processing import notify, sms
 
 log = logging.getLogger("automated_refund_processing")
 
@@ -135,7 +137,7 @@ def claim(conn, batch_size: int) -> list[dict]:
                     JOIN appointment a USING (appointment_id)
                    WHERE r.status = 'pending'
                      AND r.due_at <= now()
-                     AND is_refundable_status(a.status_label)
+                     AND is_refundable_appointment(a.status_label, a.canceled)
                      AND a.paid
                    ORDER BY r.due_at
                    LIMIT %s
@@ -147,7 +149,7 @@ def claim(conn, batch_size: int) -> list[dict]:
 
 def still_refundable(conn, appointment_id: str) -> bool:
     row = conn.execute(
-        "SELECT is_refundable_status(status_label) AND coalesce(paid, false) "
+        "SELECT is_refundable_appointment(status_label, canceled) AND coalesce(paid, false) "
         "       AND NOT is_refund_excluded_type(appointment_type) AS ok "
         "FROM appointment WHERE appointment_id = %s",
         (appointment_id,),
@@ -241,6 +243,12 @@ def run_once() -> int:
             notify.send_pending(conn)
         except Exception:
             log.exception("sending alerts failed; will retry next run")
+
+        # Text the patient about each succeeded refund (skipped unless Twilio is configured).
+        try:
+            sms.send_pending(conn)
+        except Exception:
+            log.exception("sending patient SMS failed; will retry next run")
     return len(rows)
 
 
