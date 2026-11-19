@@ -22,17 +22,18 @@ import re
 
 import requests
 
-from automated_refund_processing.notify import MAX_NOTIFY_ATTEMPTS, appointment_time, money
+from automated_refund_processing.notify import MAX_NOTIFY_ATTEMPTS, appointment_time, money, reason
 
 log = logging.getLogger("automated_refund_processing.sms")
 
 TWILIO_URL = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
 
 MESSAGE = (
-    "ScanX Health: Your refund of {amount} for your {date} appointment has been issued. "
-    "For questions, please call {clinic_phone}. "
-    "Receipt of this transaction is sent to you via your registered email in the account."
+    "ScanX Health: Your refund of {amount} for your {when} appointment, which was {reason}, "
+    "has been issued. For questions, please call {clinic_phone}."
 )
+# Added only when the appointment has a patient email on file.
+RECEIPT_SENTENCE = " Receipt of this transaction is sent to you via your registered email account."
 
 
 class PermanentError(Exception):
@@ -61,13 +62,23 @@ def to_e164(raw) -> str:
     return number
 
 
+def reason_text(trigger_status: str) -> str:
+    """'cancelled' or 'a no-show', for 'which was ...'."""
+    return "a no-show" if reason(trigger_status) == "No-show" else "cancelled"
+
+
 def message_text(row: dict) -> str:
-    appt_date = appointment_time(row)[0]
-    return MESSAGE.format(
+    appt_date, _day, appt_time = appointment_time(row)
+    when = f"{appt_date} at {appt_time}" if appt_date and appt_time else (appt_date or "recent")
+    text = MESSAGE.format(
         amount=money(row["amount_refunded"]),
-        date=appt_date or "recent",
+        when=when,
+        reason=reason_text(row["trigger_status"]),
         clinic_phone=_env("CLINIC_PHONE"),
     )
+    if (row.get("patient_email") or "").strip():
+        text += RECEIPT_SENTENCE
+    return text
 
 
 def _env(name: str) -> str:
@@ -114,7 +125,7 @@ def send_pending(conn, limit: int = 50) -> int:
     with conn.transaction():
         # Row locks are held while sending, so an overlapping run skips these rows.
         rows = conn.execute(
-            """SELECT q.*, a.phone, a.appointment_datetime,
+            """SELECT q.*, a.phone, a.email AS patient_email, a.appointment_datetime,
                       a.date AS appt_date, a.time AS appt_time
                  FROM refund_queue q
                  JOIN appointment a USING (appointment_id)

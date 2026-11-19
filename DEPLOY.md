@@ -150,12 +150,13 @@ gcloud iam service-accounts add-iam-policy-binding $SA \
 This version has the real values written out instead of shell variables, so a hidden character in a variable can't break it. Run it from the repo root:
 
 ```bash
-gcloud run jobs deploy automated-refund-processing \
-  --source . --region us-central1 \
-  --service-account automated-refund-processing@vernal-maker-473121-k4.iam.gserviceaccount.com \
-  --set-cloudsql-instances vernal-maker-473121-k4:us-central1:scanx-postgres-db \
-  --set-secrets DATABASE_URL=DB_URL:latest,STRIPE_SECRET_KEY=scanx-stripe-secret-key:latest,ACUITY_USER_ID=ACUITY_USER_ID:latest,ACUITY_API_KEY=ACUITY_API_KEY:latest,GCHAT_WEBHOOK_URL=GCHAT_WEBHOOK_Automated_refund_transactions:latest,GMAIL_SENDER_EMAIL=GMAIL_SENDER_EMAIL:latest,GMAIL_SERVICE_ACCOUNT_JSON=GMAIL_SERVICE_ACCOUNT_JSON:latest,TWILIO_ACCOUNT_SID=TWILIO_ACCOUNT_SID:latest,TWILIO_AUTH_TOKEN=TWILIO_AUTH_TOKEN:latest,TWILIO_FROM_NUMBER=TWILIO_VOICE_FROM_NUMBER:latest,CLINIC_PHONE=TWILIO_VOICE_FROM_NUMBER:latest \
-  --set-env-vars "^;^NOTIFY_EMAILS=devuser1@scanx.care,clinic1@scanx.care;DISPLAY_TIMEZONE=America/Chicago;BATCH_SIZE=20;MAX_ATTEMPTS=5" \
+gcloud run jobs deploy automated-refund-processing ^
+  --project vernal-maker-473121-k4 ^
+  --source . --region us-central1 ^
+  --service-account automated-refund-processing@vernal-maker-473121-k4.iam.gserviceaccount.com ^
+  --set-cloudsql-instances vernal-maker-473121-k4:us-central1:scanx-postgres-db ^
+  --set-secrets "DATABASE_URL=DB_URL:latest,STRIPE_SECRET_KEY=scanx-stripe-secret-key:latest,ACUITY_USER_ID=ACUITY_USER_ID:latest,ACUITY_API_KEY=ACUITY_API_KEY:latest,GCHAT_WEBHOOK_URL=GCHAT_WEBHOOK_Automated_refund_transactions:latest,GMAIL_SENDER_EMAIL=GMAIL_SENDER_EMAIL:latest,GMAIL_SERVICE_ACCOUNT_JSON=GMAIL_SERVICE_ACCOUNT_JSON:latest,TWILIO_ACCOUNT_SID=TWILIO_ACCOUNT_SID:latest,TWILIO_AUTH_TOKEN=TWILIO_AUTH_TOKEN:latest,TWILIO_FROM_NUMBER=TWILIO_VOICE_FROM_NUMBER:latest,CLINIC_PHONE=TWILIO_VOICE_FROM_NUMBER:latest" ^
+  --set-env-vars "^;^NOTIFY_EMAILS=devuser1@scanx.care,clinic1@scanx.care;DISPLAY_TIMEZONE=America/Chicago;BATCH_SIZE=20;MAX_ATTEMPTS=5" ^
   --tasks 1 --max-retries 0 --task-timeout 300s
 ```
 
@@ -163,7 +164,9 @@ gcloud run jobs deploy automated-refund-processing \
 
 The text a patient receives is:
 
-> ScanX Health: Your refund of $100.00 for your November 17, 2026 appointment has been issued. For questions, please call (214) 555-0199. Receipt of this transaction is sent to you via your registered email in the account.
+> ScanX Health: Your refund of $100.00 for your November 17, 2026 at 8:45 AM CST appointment, which was cancelled, has been issued. For questions, please call (214) 555-0199. Receipt of this transaction is sent to you via your registered email account.
+
+"which was" says `cancelled` or `a no-show`. If the appointment has no patient email on file, the last sentence (the receipt line) is left out and the rest is unchanged.
 
 It is sent once per succeeded refund, to the phone number on the appointment (numbers without a country code are treated as US). Refunds that were already done by hand are not texted. Failures are in `refund_queue.sms_error`; temporary ones are retried on the next run (up to 5 times), bad or missing numbers are not retried. Check with `SELECT id, appointment_id, sms_notified_at, sms_attempts, sms_error FROM refund_queue WHERE status = 'succeeded' ORDER BY id DESC;`.
 

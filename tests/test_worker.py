@@ -378,13 +378,27 @@ def test_patient_gets_the_refund_text(conn, fakes, texts):
     refunded(conn, fakes, "S1")
     assert texts["messages"] == [(
         "+916355325189",
-        "ScanX Health: Your refund of $100.00 for your November 17, 2026 appointment has been issued. "
-        "For questions, please call (214) 555-0199. "
-        "Receipt of this transaction is sent to you via your registered email in the account.")]
+        "ScanX Health: Your refund of $100.00 for your November 17, 2026 at 8:45 AM CST appointment, "
+        "which was cancelled, has been issued. For questions, please call (214) 555-0199. "
+        "Receipt of this transaction is sent to you via your registered email account.")]
     assert conn.execute("SELECT sms_notified_at IS NOT NULL, sms_attempts FROM refund_queue "
                         "WHERE appointment_id = 'S1'").fetchone() == (True, 0)
     worker.run_once()
     assert len(texts["messages"]) == 1  # never texted twice
+
+
+def test_no_show_text_says_so(conn, fakes, texts):
+    refunded(conn, fakes, "S1b", status="No Show")
+    assert "appointment, which was a no-show, has been issued." in texts["messages"][0][1]
+
+
+@pytest.mark.parametrize("email", [None, "", "   "])
+def test_text_without_patient_email_drops_the_receipt_line(conn, fakes, texts, email):
+    refunded(conn, fakes, "S1c", email=email)
+    assert texts["messages"] == [(
+        "+916355325189",
+        "ScanX Health: Your refund of $100.00 for your November 17, 2026 at 8:45 AM CST appointment, "
+        "which was cancelled, has been issued. For questions, please call (214) 555-0199.")]
 
 
 def test_no_text_unless_refund_succeeded(conn, fakes, texts):
